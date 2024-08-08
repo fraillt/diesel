@@ -15,7 +15,7 @@ use std::io::{stderr, Write};
 use std::os::raw as libc;
 use std::ptr::{self, NonNull};
 
-pub(super) struct Statement {
+pub(crate) struct Statement {
     inner_statement: NonNull<ffi::sqlite3_stmt>,
 }
 

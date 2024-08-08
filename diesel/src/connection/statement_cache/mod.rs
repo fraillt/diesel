@@ -10,8 +10,9 @@
 //! statements is [`SimpleConnection::batch_execute`](super::SimpleConnection::batch_execute).
 //!
 //! In order to avoid the cost of re-parsing and planning subsequent queries,
-//! Diesel caches the prepared statement whenever possible. Queries will fall
-//! into one of three buckets:
+//! by default Diesel caches the prepared statement whenever possible, but
+//! this an be customized by calling [`Connection::set_cache_size`](super::Connection::set_cache_size).
+//! Queries will fall into one of three buckets:
 //!
 //! - Unsafe to cache
 //! - Cached by SQL
@@ -94,16 +95,21 @@
 
 use std::any::TypeId;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
+
+use strategy::{StatementCacheStrategy, WithCacheStrategy, WithoutCacheStrategy};
 
 use crate::backend::Backend;
 use crate::connection::InstrumentationEvent;
 use crate::query_builder::*;
 use crate::result::QueryResult;
 
-use super::Instrumentation;
+use super::{CacheSize, Instrumentation};
+
+/// Various interfaces and implementations to control connection statement caching.
+#[allow(unreachable_pub)]
+pub mod strategy;
 
 /// A prepared statement cache
 #[allow(missing_debug_implementations, unreachable_pub)]
@@ -112,7 +118,10 @@ use super::Instrumentation;
     doc(cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))
 )]
 pub struct StatementCache<DB: Backend, Statement> {
-    pub(crate) cache: HashMap<StatementCacheKey<DB>, Statement>,
+    cache: Box<dyn StatementCacheStrategy<DB, Statement>>,
+    // increment every time a query is cached
+    // some backends might use it to create unique prepared statement names
+    cache_counter: u64,
 }
 
 /// A helper type that indicates if a certain query
@@ -134,39 +143,41 @@ pub enum PrepareForCache {
     No,
 }
 
-#[allow(
-    clippy::len_without_is_empty,
-    clippy::new_without_default,
-    unreachable_pub
-)]
+#[allow(clippy::new_without_default, unreachable_pub)]
 impl<DB, Statement> StatementCache<DB, Statement>
 where
-    DB: Backend,
+    DB: Backend + 'static,
+    Statement: 'static,
     DB::TypeMetadata: Clone,
     DB::QueryBuilder: Default,
     StatementCacheKey<DB>: Hash + Eq,
 {
-    /// Create a new prepared statement cache
+    /// Create a new prepared statement cache using [`CacheSize::Unbounded`] as caching strategy.
     #[allow(unreachable_pub)]
     pub fn new() -> Self {
         StatementCache {
-            cache: HashMap::new(),
+            cache: Box::new(WithCacheStrategy::default()),
+            cache_counter: 0,
         }
     }
 
-    /// Get the current length of the statement cache
-    #[allow(unreachable_pub)]
-    #[cfg(any(
-        feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
-        feature = "postgres",
-        all(feature = "sqlite", test)
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))
-    )]
-    pub fn len(&self) -> usize {
-        self.cache.len()
+    /// Set caching strategy from predefined implementations
+    pub fn set_cache_size(&mut self, size: CacheSize) {
+        if self.cache.strategy() != size {
+            self.cache = match size {
+                CacheSize::Unbounded => Box::new(WithCacheStrategy::default()),
+                CacheSize::Disabled => Box::new(WithoutCacheStrategy::default()),
+            }
+        }
+    }
+
+    /// Setting custom caching strategy. It is used in tests, to verify caching logic
+    #[allow(dead_code)]
+    pub(crate) fn set_strategy<Strategy>(&mut self, s: Strategy)
+    where
+        Strategy: StatementCacheStrategy<DB, Statement> + 'static,
+    {
+        self.cache = Box::new(s);
     }
 
     /// Prepare a query as prepared statement
@@ -191,52 +202,41 @@ where
     ) -> QueryResult<MaybeCached<'_, Statement>>
     where
         T: QueryFragment<DB> + QueryId,
-        F: FnMut(&str, PrepareForCache) -> QueryResult<Statement>,
+        F: FnMut(&str, Option<u64>) -> QueryResult<Statement>,
     {
-        self.cached_statement_non_generic(
+        Self::cached_statement_non_generic(
+            self.cache.as_mut(),
             T::query_id(),
             source,
             backend,
             bind_types,
-            &mut prepare_fn,
-            instrumentation,
+            &mut |sql, is_cached| {
+                if let PrepareForCache::Yes = is_cached {
+                    instrumentation.on_connection_event(InstrumentationEvent::CacheQuery { sql });
+                    self.cache_counter += 1;
+                    prepare_fn(sql, Some(self.cache_counter))
+                } else {
+                    prepare_fn(sql, None)
+                }
+            },
         )
     }
 
     /// Reduce the amount of monomorphized code by factoring this via dynamic dispatch
-    fn cached_statement_non_generic(
-        &mut self,
+    fn cached_statement_non_generic<'a>(
+        cache: &'a mut dyn StatementCacheStrategy<DB, Statement>,
         maybe_type_id: Option<TypeId>,
         source: &dyn QueryFragmentForCachedStatement<DB>,
         backend: &DB,
         bind_types: &[DB::TypeMetadata],
         prepare_fn: &mut dyn FnMut(&str, PrepareForCache) -> QueryResult<Statement>,
-        instrumentation: &mut dyn Instrumentation,
-    ) -> QueryResult<MaybeCached<'_, Statement>> {
-        use std::collections::hash_map::Entry::{Occupied, Vacant};
-
+    ) -> QueryResult<MaybeCached<'a, Statement>> {
         let cache_key = StatementCacheKey::for_source(maybe_type_id, source, bind_types, backend)?;
-
         if !source.is_safe_to_cache_prepared(backend)? {
             let sql = cache_key.sql(source, backend)?;
             return prepare_fn(&sql, PrepareForCache::No).map(MaybeCached::CannotCache);
         }
-
-        let cached_result = match self.cache.entry(cache_key) {
-            Occupied(entry) => entry.into_mut(),
-            Vacant(entry) => {
-                let statement = {
-                    let sql = entry.key().sql(source, backend)?;
-                    instrumentation
-                        .on_connection_event(InstrumentationEvent::CacheQuery { sql: &sql });
-                    prepare_fn(&sql, PrepareForCache::Yes)
-                };
-
-                entry.insert(statement?)
-            }
-        };
-
-        Ok(MaybeCached::Cached(cached_result))
+        cache.get(cache_key, backend, source, prepare_fn)
     }
 }
 

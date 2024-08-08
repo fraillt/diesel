@@ -31,6 +31,7 @@ use crate::result::*;
 use crate::serialize::ToSql;
 use crate::sql_types::{HasSqlType, TypeMetadata};
 use crate::sqlite::Sqlite;
+use statement_cache::PrepareForCache;
 
 /// Connections for the SQLite backend. Unlike other backends, SQLite supported
 /// connection URLs are:
@@ -121,7 +122,8 @@ pub struct SqliteConnection {
     // statement_cache needs to be before raw_connection
     // otherwise we will get errors about open statements before closing the
     // connection itself
-    statement_cache: StatementCache<Sqlite, Statement>,
+    // pub(crate) for tests
+    pub(crate) statement_cache: StatementCache<Sqlite, Statement>,
     raw_connection: RawConnection,
     transaction_state: AnsiTransactionManager,
     // this exists for the sole purpose of implementing `WithMetadataLookup` trait
@@ -203,6 +205,10 @@ impl Connection for SqliteConnection {
 
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
         self.instrumentation = instrumentation.into();
+    }
+
+    fn set_cache_size(&mut self, size: CacheSize) {
+        self.statement_cache.set_cache_size(size);
     }
 }
 
@@ -351,7 +357,15 @@ impl SqliteConnection {
             &source,
             &Sqlite,
             &[],
-            |sql, is_cached| Statement::prepare(raw_connection, sql, is_cached),
+            |sql, counter| {
+                Statement::prepare(
+                    raw_connection,
+                    sql,
+                    counter
+                        .map(|_| PrepareForCache::Yes)
+                        .unwrap_or(PrepareForCache::No),
+                )
+            },
             &mut *self.instrumentation,
         ) {
             Ok(statement) => statement,
@@ -558,6 +572,17 @@ mod tests {
     use crate::dsl::sql;
     use crate::prelude::*;
     use crate::sql_types::Integer;
+    use crate::sqlite::connection::statement_cache::strategy::testing_utils::{
+        consume_statement_caching_calls, CachingOutcome, IntrospectCachingStrategy,
+    };
+    use crate::sqlite::connection::statement_cache::strategy::WithCacheStrategy;
+
+    fn connection() -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.statement_cache
+            .set_strategy(IntrospectCachingStrategy::new(WithCacheStrategy::default()));
+        conn
+    }
 
     #[test]
     fn database_serializes_and_deserializes_successfully() {
@@ -574,73 +599,79 @@ mod tests {
             ),
         ];
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let conn1 = &mut connection();
         let _ =
             crate::sql_query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
-                .execute(connection);
+                .execute(conn1);
         let _ = crate::sql_query("INSERT INTO users (name, email) VALUES ('John Doe', 'john.doe@example.com'), ('Jane Doe', 'jane.doe@example.com')")
-            .execute(connection);
+            .execute(conn1);
 
-        let serialized_database = connection.serialize_database_to_buffer();
+        let serialized_database = conn1.serialize_database_to_buffer();
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
-        connection
+        let conn2 = &mut connection();
+        conn2
             .deserialize_readonly_database_from_buffer(serialized_database.as_slice())
             .unwrap();
 
         let query = sql::<(Integer, Text, Text)>("SELECT id, name, email FROM users ORDER BY id");
-        let actual_users = query.load::<(i32, String, String)>(connection).unwrap();
+        let actual_users = query.load::<(i32, String, String)>(conn2).unwrap();
 
         assert_eq!(expected_users, actual_users);
     }
 
     #[test]
     fn prepared_statements_are_cached_when_run() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         let query = crate::select(1.into_sql::<Integer>());
 
         assert_eq!(Ok(1), query.get_result(connection));
         assert_eq!(Ok(1), query.get_result(connection));
-        assert_eq!(1, connection.statement_cache.len());
+
+        let outcome = consume_statement_caching_calls();
+        assert_eq!(1, outcome.count(CachingOutcome::Cache));
+        assert_eq!(1, outcome.count(CachingOutcome::UseCached));
     }
 
     #[test]
     fn sql_literal_nodes_are_not_cached() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         let query = crate::select(sql::<Integer>("1"));
 
         assert_eq!(Ok(1), query.get_result(connection));
-        assert_eq!(0, connection.statement_cache.len());
+        assert!(consume_statement_caching_calls().is_empty());
     }
 
     #[test]
     fn queries_containing_sql_literal_nodes_are_not_cached() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         let one_as_expr = 1.into_sql::<Integer>();
         let query = crate::select(one_as_expr.eq(sql::<Integer>("1")));
 
         assert_eq!(Ok(true), query.get_result(connection));
-        assert_eq!(0, connection.statement_cache.len());
+        assert!(consume_statement_caching_calls().is_empty());
     }
 
     #[test]
     fn queries_containing_in_with_vec_are_not_cached() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         let one_as_expr = 1.into_sql::<Integer>();
         let query = crate::select(one_as_expr.eq_any(vec![1, 2, 3]));
 
         assert_eq!(Ok(true), query.get_result(connection));
-        assert_eq!(0, connection.statement_cache.len());
+        assert!(consume_statement_caching_calls().is_empty());
     }
 
     #[test]
     fn queries_containing_in_with_subselect_are_cached() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         let one_as_expr = 1.into_sql::<Integer>();
         let query = crate::select(one_as_expr.eq_any(crate::select(one_as_expr)));
 
         assert_eq!(Ok(true), query.get_result(connection));
-        assert_eq!(1, connection.statement_cache.len());
+        assert_eq!(
+            1,
+            consume_statement_caching_calls().count(CachingOutcome::Cache)
+        );
     }
 
     use crate::sql_types::Text;
@@ -648,7 +679,7 @@ mod tests {
 
     #[test]
     fn register_custom_function() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         fun_case_utils::register_impl(connection, |x: String| {
             x.chars()
                 .enumerate()
@@ -673,7 +704,7 @@ mod tests {
 
     #[test]
     fn register_multiarg_function() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         my_add_utils::register_impl(connection, |x: i32, y: i32| x + y).unwrap();
 
         let added = crate::select(my_add(1, 2)).get_result::<i32>(connection);
@@ -684,7 +715,7 @@ mod tests {
 
     #[test]
     fn register_noarg_function() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         answer_utils::register_impl(connection, || 42).unwrap();
 
         let answer = crate::select(answer()).get_result::<i32>(connection);
@@ -693,7 +724,7 @@ mod tests {
 
     #[test]
     fn register_nondeterministic_noarg_function() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         answer_utils::register_nondeterministic_impl(connection, || 42).unwrap();
 
         let answer = crate::select(answer()).get_result::<i32>(connection);
@@ -704,7 +735,7 @@ mod tests {
 
     #[test]
     fn register_nondeterministic_function() {
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         let mut y = 0;
         add_counter_utils::register_nondeterministic_impl(connection, move |x: i32| {
             y += 1;
@@ -750,7 +781,7 @@ mod tests {
     fn register_aggregate_function() {
         use self::my_sum_example::dsl::*;
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         crate::sql_query(
             "CREATE TABLE my_sum_example (id integer primary key autoincrement, value integer)",
         )
@@ -772,7 +803,7 @@ mod tests {
     fn register_aggregate_function_returns_finalize_default_on_empty_set() {
         use self::my_sum_example::dsl::*;
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         crate::sql_query(
             "CREATE TABLE my_sum_example (id integer primary key autoincrement, value integer)",
         )
@@ -834,7 +865,7 @@ mod tests {
     fn register_aggregate_multiarg_function() {
         use self::range_max_example::dsl::*;
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
         crate::sql_query(
             r#"CREATE TABLE range_max_example (
                 id integer primary key autoincrement,
@@ -870,7 +901,7 @@ mod tests {
     fn register_collation_function() {
         use self::my_collation_example::dsl::*;
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
 
         connection
             .register_collation("RUSTNOCASE", |rhs, lhs| {
@@ -950,7 +981,7 @@ mod tests {
             }
         }
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
 
         let res = crate::select(
             CustomWrapper("".into())
@@ -980,7 +1011,7 @@ mod tests {
             }
         }
 
-        let connection = &mut SqliteConnection::establish(":memory:").unwrap();
+        let connection = &mut connection();
 
         let res = crate::select(
             CustomWrapper(Vec::new())

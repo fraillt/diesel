@@ -124,7 +124,8 @@ pub(super) use self::result::PgResult;
 #[allow(missing_debug_implementations)]
 #[cfg(feature = "postgres")]
 pub struct PgConnection {
-    statement_cache: StatementCache<Pg, Statement>,
+    /// pub(crate) for tests
+    pub(crate) statement_cache: StatementCache<Pg, Statement>,
     metadata_cache: PgMetadataCache,
     connection_and_transaction_manager: ConnectionAndTransactionManager,
 }
@@ -235,6 +236,10 @@ impl Connection for PgConnection {
 
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
         self.connection_and_transaction_manager.instrumentation = instrumentation.into();
+    }
+
+    fn set_cache_size(&mut self, size: CacheSize) {
+        self.statement_cache.set_cache_size(size);
     }
 }
 
@@ -499,19 +504,14 @@ impl PgConnection {
         let binds = bind_collector.binds;
         let metadata = bind_collector.metadata;
 
-        let cache_len = self.statement_cache.len();
         let cache = &mut self.statement_cache;
         let conn = &mut self.connection_and_transaction_manager.raw_connection;
         let query = cache.cached_statement(
             &source,
             &Pg,
             &metadata,
-            |sql, _| {
-                let query_name = if source.is_safe_to_cache_prepared(&Pg)? {
-                    Some(format!("__diesel_stmt_{cache_len}"))
-                } else {
-                    None
-                };
+            |sql, counter| {
+                let query_name = counter.map(|counter| format!("__diesel_stmt_{counter}"));
                 Statement::prepare(conn, sql, query_name.as_deref(), &metadata)
             },
             &mut *self.connection_and_transaction_manager.instrumentation,
@@ -613,12 +613,20 @@ mod private {
 mod tests {
     extern crate dotenvy;
 
+    use statement_cache::strategy::testing_utils::{
+        consume_statement_caching_calls, CachingOutcome,
+    };
+
     use super::*;
     use crate::dsl::sql;
     use crate::prelude::*;
     use crate::result::Error::DatabaseError;
     use crate::sql_types::{Integer, VarChar};
     use std::num::NonZeroU32;
+
+    fn connection() -> PgConnection {
+        crate::test_helpers::pg_connection_no_transaction()
+    }
 
     #[test]
     fn malformed_sql_query() {
@@ -641,7 +649,9 @@ mod tests {
 
         assert_eq!(Ok(1), query.get_result(connection));
         assert_eq!(Ok(1), query.get_result(connection));
-        assert_eq!(1, connection.statement_cache.len());
+        let outcome = consume_statement_caching_calls();
+        assert_eq!(1, outcome.count(CachingOutcome::UseCached));
+        assert_eq!(1, outcome.count(CachingOutcome::Cache));
     }
 
     #[test]
@@ -653,7 +663,10 @@ mod tests {
 
         assert_eq!(Ok(1), query.get_result(connection));
         assert_eq!(Ok("hi".to_string()), query2.get_result(connection));
-        assert_eq!(2, connection.statement_cache.len());
+        assert_eq!(
+            2,
+            consume_statement_caching_calls().count(CachingOutcome::Cache)
+        );
     }
 
     #[test]
@@ -663,10 +676,12 @@ mod tests {
         let query = crate::select(1.into_sql::<Integer>()).into_boxed::<Pg>();
         let query2 = crate::select("hi".into_sql::<VarChar>()).into_boxed::<Pg>();
 
-        assert_eq!(0, connection.statement_cache.len());
         assert_eq!(Ok(1), query.get_result(connection));
         assert_eq!(Ok("hi".to_string()), query2.get_result(connection));
-        assert_eq!(2, connection.statement_cache.len());
+        assert_eq!(
+            2,
+            consume_statement_caching_calls().count(CachingOutcome::Cache)
+        );
     }
 
     define_sql_function!(fn lower(x: VarChar) -> VarChar);
@@ -679,10 +694,12 @@ mod tests {
         let query = crate::select(hi).into_boxed::<Pg>();
         let query2 = crate::select(lower(hi)).into_boxed::<Pg>();
 
-        assert_eq!(0, connection.statement_cache.len());
         assert_eq!(Ok("HI".to_string()), query.get_result(connection));
         assert_eq!(Ok("hi".to_string()), query2.get_result(connection));
-        assert_eq!(2, connection.statement_cache.len());
+        assert_eq!(
+            2,
+            consume_statement_caching_calls().count(CachingOutcome::Cache)
+        );
     }
 
     #[test]
@@ -691,7 +708,7 @@ mod tests {
         let query = crate::select(sql::<Integer>("1"));
 
         assert_eq!(Ok(1), query.get_result(connection));
-        assert_eq!(0, connection.statement_cache.len());
+        assert!(consume_statement_caching_calls().is_empty());
     }
 
     table! {
@@ -717,14 +734,16 @@ mod tests {
             .insert_into(users::table)
             .into_columns((users::id, users::name));
         assert!(insert.execute(connection).is_ok());
-        assert_eq!(1, connection.statement_cache.len());
 
         let query = users::table.filter(users::id.eq(42)).into_boxed();
         let insert = query
             .insert_into(users::table)
             .into_columns((users::id, users::name));
         assert!(insert.execute(connection).is_ok());
-        assert_eq!(2, connection.statement_cache.len());
+        assert_eq!(
+            2,
+            consume_statement_caching_calls().count(CachingOutcome::Cache)
+        );
     }
 
     #[test]
@@ -742,7 +761,10 @@ mod tests {
             crate::insert_into(users::table).values((users::id.eq(42), users::name.eq("Foo")));
 
         assert!(insert.execute(connection).is_ok());
-        assert_eq!(1, connection.statement_cache.len());
+        assert_eq!(
+            1,
+            consume_statement_caching_calls().count(CachingOutcome::Cache)
+        );
     }
 
     #[test]
@@ -760,7 +782,7 @@ mod tests {
             .values(vec![(users::id.eq(42), users::name.eq("Foo"))]);
 
         assert!(insert.execute(connection).is_ok());
-        assert_eq!(0, connection.statement_cache.len());
+        assert!(consume_statement_caching_calls().is_empty());
     }
 
     #[test]
@@ -778,7 +800,9 @@ mod tests {
             crate::insert_into(users::table).values([(users::id.eq(42), users::name.eq("Foo"))]);
 
         assert!(insert.execute(connection).is_ok());
-        assert_eq!(1, connection.statement_cache.len());
+        let outcome = consume_statement_caching_calls();
+        assert_eq!(1, outcome.count(CachingOutcome::Cache));
+        assert_eq!(1, outcome.calls.len());
     }
 
     #[test]
@@ -788,11 +812,10 @@ mod tests {
         let query = crate::select(one_as_expr.eq_any(vec![1, 2, 3]));
 
         assert_eq!(Ok(true), query.get_result(connection));
-        assert_eq!(1, connection.statement_cache.len());
-    }
-
-    fn connection() -> PgConnection {
-        crate::test_helpers::pg_connection_no_transaction()
+        assert_eq!(
+            1,
+            consume_statement_caching_calls().count(CachingOutcome::Cache)
+        );
     }
 
     #[test]

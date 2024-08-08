@@ -60,7 +60,13 @@ pub fn pg_connection() -> PgConnection {
 
 #[cfg(feature = "postgres")]
 pub fn pg_connection_no_transaction() -> PgConnection {
-    PgConnection::establish(&pg_database_url()).unwrap()
+    use crate::connection::statement_cache::strategy::{
+        testing_utils::IntrospectCachingStrategy, WithCacheStrategy,
+    };
+    let mut conn = PgConnection::establish(&pg_database_url()).unwrap();
+    conn.statement_cache
+        .set_strategy(IntrospectCachingStrategy::new(WithCacheStrategy::default()));
+    conn
 }
 
 #[cfg(feature = "postgres")]
